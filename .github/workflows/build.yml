@@ -1,0 +1,83 @@
+name: Build vLLM SIF
+
+on:
+  workflow_dispatch:            # manual "Run workflow" button
+  push:
+    branches: [main]
+    paths: [vllm.def]           # rebuild when the def file changes
+
+permissions:
+  contents: write               # needed to publish the release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04       # x86_64 runner, so the image is pulled as amd64
+    env:
+      DEF: vllm.def
+      PART_SIZE: 1900M          # each release asset must be < 2 GiB
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          # The image unpacks to roughly 20-25 GB, so the runner's ~25 GB of free space isn't enough
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache /usr/share/swift
+          sudo docker system prune -af > /dev/null
+          # If the runner has a second disk on /mnt, keep the layer cache there
+          if mountpoint -q /mnt; then
+            sudo swapoff -a && sudo rm -f /mnt/swapfile
+            sudo mkdir -p /mnt/apptainer-cache
+            echo "APPTAINER_CACHEDIR=/mnt/apptainer-cache" >> "$GITHUB_ENV"
+          fi
+          df -h
+
+      - name: Install Apptainer
+        run: |
+          sudo add-apt-repository -y ppa:apptainer/ppa
+          sudo apt-get install -y apptainer
+          apptainer --version
+
+      - name: Set names from the def file
+        run: |
+          tag=$(awk -F: '/^From:/ {print $NF; exit}' "$DEF" | tr -d '[:space:]')
+          {
+            echo "VLLM_TAG=$tag"
+            echo "SIF=vllm-openai-$tag.sif"
+            echo "RELEASE=vllm-$tag"
+          } >> "$GITHUB_ENV"
+
+      - name: Build SIF
+        run: |
+          sudo --preserve-env=APPTAINER_CACHEDIR apptainer build "$SIF" "$DEF"
+          sudo --preserve-env=APPTAINER_CACHEDIR apptainer cache clean --force
+          sudo chown "$(id -u):$(id -g)" "$SIF"
+          ls -lh "$SIF"
+
+      - name: Split into parts
+        run: |
+          split -b "$PART_SIZE" -d -a 2 "$SIF" "$SIF.part-"
+          sha256sum "$SIF" "$SIF".part-* > SHA256SUMS
+          rm "$SIF"
+          ls -lh "$SIF".part-*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          Apptainer image built from \`$DEF\` (\`vllm/vllm-openai:$VLLM_TAG\`, linux/amd64).
+
+          Rejoin and verify:
+          \`\`\`
+          cat $SIF.part-* > $SIF
+          sha256sum -c SHA256SUMS
+          \`\`\`
+          EOF
+          # Replace any earlier release for this version so reruns work
+          gh release delete "$RELEASE" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2> /dev/null || true
+          gh release create "$RELEASE" "$SIF".part-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "vLLM $VLLM_TAG (Apptainer SIF, amd64)" \
+            --notes-file notes.md
